@@ -7,7 +7,15 @@ import random
 
 st.set_page_config(page_title="台股多策略全量化評分選股系統", page_icon="📈", layout="wide")
 st.title("📈 台股多策略全量化評分選股系統")
-st.caption("官方 API 直連版——收盤價與成交量 100% 準確抓取，徹底解決 API 封鎖與資料缺失！")
+
+# 檢查當前時間是否已過下午 1:30 (台股收盤時間)
+now_time = datetime.datetime.now()
+is_after_market_close = now_time.time() >= datetime.time(13, 30)
+
+if is_after_market_close:
+    st.caption("🔥 **即時連線中**：當前已過下午 1:30 收盤時間，系統將自動抓取今日最新盤後收盤資訊！")
+else:
+    st.caption("💡 **盤中預設模式**：下午 1:30 後將自動啟用即時盤後資訊更新機制。")
 
 # ----------------------------------------------------
 # 1. 側邊欄策略與範圍設定
@@ -94,20 +102,22 @@ def parse_float(val):
     except Exception: return 0.0
 
 # ----------------------------------------------------
-# 4. 直連證交所/櫃買中心官方資料庫 (免 Token、零封鎖)
+# 4. 直連證交所/櫃買中心 (過 1:30 自動強制作業即時更新)
 # ----------------------------------------------------
 @st.cache_data(ttl=1800)
-def fetch_tw_market_data():
+def fetch_tw_market_data(force_fresh=False):
     market_data = {}
     
-    # A. 抓取上市櫃本益比、淨值比、殖利率
+    # A. 抓取上市櫃本益比、淨值比、殖利率與股票名稱
     try:
         res_twse_val = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=5)
         if res_twse_val.status_code == 200:
             for item in res_twse_val.json():
                 code = item.get('Code', '')
+                name = item.get('Name', '').strip()
                 if len(code) == 4 and code.isdigit():
                     market_data[code] = {
+                        "Name": name,
                         "PE": parse_float(item.get('PEratio')),
                         "PB": parse_float(item.get('PBratio')),
                         "Yield": parse_float(item.get('DividendYield')),
@@ -121,24 +131,27 @@ def fetch_tw_market_data():
         if res_tpex_val.status_code == 200:
             for item in res_tpex_val.json():
                 code = item.get('SecuritiesCompanyCode', '')
+                name = item.get('CompanyName', '').strip()
                 if len(code) == 4 and code.isdigit():
-                    if code not in market_data: market_data[code] = {}
+                    if code not in market_data: market_data[code] = {"Name": name}
                     market_data[code].update({
+                        "Name": name if name else market_data[code].get("Name", ""),
                         "PE": parse_float(item.get('PERatio')),
                         "PB": parse_float(item.get('PBRatio')),
                         "Yield": parse_float(item.get('YieldRatio'))
                     })
     except Exception: pass
 
-    # B. 抓取上市櫃每日收盤價與成交量 (官方 API 直連)
+    # B. 抓取上市櫃每日收盤價與成交量
     try:
         res_twse_price = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=5)
         if res_twse_price.status_code == 200:
             for item in res_twse_price.json():
                 code = item.get('Code', '')
+                name = item.get('Name', '').strip()
                 if code in market_data:
+                    if name: market_data[code]["Name"] = name
                     market_data[code]["Close"] = parse_float(item.get('ClosingPrice'))
-                    # 成交股數轉成成交張數
                     market_data[code]["Volume"] = int(parse_float(item.get('TradeVolume')) / 1000)
     except Exception: pass
 
@@ -147,7 +160,9 @@ def fetch_tw_market_data():
         if res_tpex_price.status_code == 200:
             for item in res_tpex_price.json():
                 code = item.get('SecuritiesCompanyCode', '')
+                name = item.get('CompanyName', '').strip()
                 if code in market_data:
+                    if name: market_data[code]["Name"] = name
                     market_data[code]["Close"] = parse_float(item.get('Close'))
                     market_data[code]["Volume"] = int(parse_float(item.get('TradingShares')) / 1000)
     except Exception: pass
@@ -155,32 +170,47 @@ def fetch_tw_market_data():
     return market_data
 
 # ----------------------------------------------------
-# 5. 評分計算 (百分百取得收盤價與成交量)
+# 5. 精細化評分計算
 # ----------------------------------------------------
 def calculate_score(sid, info):
+    name = info.get("Name", "")
+    stock_display = f"{sid} {name}" if name else sid
+
     close_price = info.get("Close", 0.0)
     vol_lots = info.get("Volume", 0)
     pe = info.get("PE", 0.0)
     pb = info.get("PB", 0.0)
     dy = info.get("Yield", 0.0)
 
-    # 成交量篩選
+    # 成交量過濾
     if use_vol_filter and not (min_vol <= vol_lots <= max_vol):
         return None
 
     score = 0
     est_eps = round(close_price / pe, 2) if pe > 0 and close_price > 0 else 0.0
 
-    # 策略 1：SMC 聰明錢評分
+    # 策略 1：SMC 聰明錢
     if "SMC" in strategy:
-        if pe > 0 and pe <= 15: score += 40
-        elif pe > 0 and pe <= 25: score += 20
-        if pb > 0 and pb <= 2.0: score += 30
-        if dy >= 3.0: score += 30
-        grade = "🏆 S級 (完美爆發)" if score >= 80 else ("🔥 A級 (高度接近)" if score >= 50 else "👀 B級 (結構醞釀)" if score >= 20 else "🔹 C級 (普通格局)")
+        if 0 < pe <= 10: score += 35
+        elif 10 < pe <= 15: score += 28
+        elif 15 < pe <= 20: score += 20
+        elif 20 < pe <= 30: score += 10
+        elif pe > 0: score += 5
+
+        if 0 < pb <= 1.2: score += 35
+        elif 1.2 < pb <= 1.8: score += 28
+        elif 1.8 < pb <= 2.5: score += 20
+        elif pb > 0: score += 10
+
+        if dy >= 6.0: score += 30
+        elif 4.0 <= dy < 6.0: score += 22
+        elif 2.0 <= dy < 4.0: score += 15
+        elif dy > 0: score += 5
+
+        grade = "🏆 S級 (頂級機構標的)" if score >= 85 else ("🔥 A級 (強勢估值)" if score >= 65 else "👀 B級 (結構醞釀)" if score >= 40 else "🔹 C級 (普通格局)")
         return {
             "綜合評分": score,
-            "股票代碼": sid,
+            "股票名稱與代碼": stock_display,
             "評級等級": grade,
             "最新收盤": close_price if close_price > 0 else "—",
             "成交量(張)": vol_lots if vol_lots > 0 else "—",
@@ -191,14 +221,22 @@ def calculate_score(sid, info):
 
     # 策略 2：KD + MACD + RSI
     elif "KD + MACD" in strategy:
-        if dy >= 4.0: score += 40
-        elif dy >= 2.0: score += 20
-        if pe > 0 and pe <= 20: score += 30
-        if pb > 0 and pb <= 2.5: score += 30
+        if dy >= 5.0: score += 35
+        elif dy >= 3.0: score += 25
+        elif dy > 0: score += 10
+
+        if 0 < pe <= 12: score += 35
+        elif 12 < pe <= 20: score += 25
+        elif pe > 0: score += 10
+
+        if 0 < pb <= 1.5: score += 30
+        elif 0 < pb <= 2.5: score += 20
+        elif pb > 0: score += 10
+
         grade = "🏆 S級 (雙金爆發)" if score >= 80 else ("🔥 A級 (強勢共振)" if score >= 50 else "👀 B級 (醞釀中)" if score >= 20 else "🔹 C級 (弱勢趨勢)")
         return {
             "綜合評分": score,
-            "股票代碼": sid,
+            "股票名稱與代碼": stock_display,
             "評級等級": grade,
             "最新收盤": close_price if close_price > 0 else "—",
             "成交量(張)": vol_lots if vol_lots > 0 else "—",
@@ -216,7 +254,7 @@ def calculate_score(sid, info):
         grade = "🏆 S級 (極度便宜)" if score >= 80 else ("🔥 A級 (估值優良)" if score >= 50 else "👀 B級 (估值合理)" if score >= 20 else "🔹 C級 (估值偏高)")
         return {
             "綜合評分": score,
-            "股票代碼": sid,
+            "股票名稱與代碼": stock_display,
             "評級等級": grade,
             "最新收盤": close_price if close_price > 0 else "—",
             "成交量(張)": vol_lots if vol_lots > 0 else "—",
@@ -235,7 +273,7 @@ def calculate_score(sid, info):
         grade = "🏆 S級 (高獲利績優)" if score >= 80 else ("🔥 A級 (穩健成長)" if score >= 50 else "👀 B級 (體質尚可)" if score >= 20 else "🔹 C級 (普通水準)")
         return {
             "綜合評分": score,
-            "股票代碼": sid,
+            "股票名稱與代碼": stock_display,
             "評級等級": grade,
             "最新收盤": close_price if close_price > 0 else "—",
             "成交量(張)": vol_lots if vol_lots > 0 else "—",
@@ -246,14 +284,16 @@ def calculate_score(sid, info):
 
     # 策略 5：黑美人戰法
     else:
-        if vol_lots >= 1000: score += 40
-        elif vol_lots >= 500: score += 20
-        if 0 < pe <= 20: score += 30
-        if dy >= 2.0: score += 30
+        if vol_lots >= 3000: score += 40
+        elif vol_lots >= 1000: score += 25
+        elif vol_lots >= 500: score += 10
+        if 0 < pe <= 15: score += 30
+        elif 0 < pe <= 25: score += 15
+        if dy >= 3.0: score += 30
         grade = "🏆 S級 (完美起飛)" if score >= 80 else ("🔥 A級 (強勢買點)" if score >= 50 else "👀 B級 (醞釀中)" if score >= 20 else "🔹 C級 (盤整盤)")
         return {
             "綜合評分": score,
-            "股票代碼": sid,
+            "股票名稱與代碼": stock_display,
             "評級等級": grade,
             "最新收盤": close_price if close_price > 0 else "—",
             "成交量(張)": vol_lots if vol_lots > 0 else "—",
@@ -265,8 +305,11 @@ def calculate_score(sid, info):
 # 6. 主程式執行區
 # ----------------------------------------------------
 if st.button("⚡ 開始全量化評分掃描"):
-    with st.spinner("正在直連台灣證券交易所官方 API 載入最新數據..."):
-        market_data = fetch_tw_market_data()
+    # 下午 1:30 後傳遞不同參數觸發實時更新
+    fresh_flag = is_after_market_close
+    
+    with st.spinner("正在直連台灣證券交易所官方 API 載入最新數據與股票名稱..."):
+        market_data = fetch_tw_market_data(force_fresh=fresh_flag)
         all_stocks = list(market_data.keys())
         
         if "100" in scan_mode:
@@ -276,7 +319,7 @@ if st.button("⚡ 開始全量化評分掃描"):
         else:
             target_stocks = ["2330", "2317", "2454", "2382", "3231", "2308", "2353", "3576", "2408", "5347", "2603", "2609", "2615", "2303", "3037", "2379", "3034", "2377", "2357", "3017", "6669", "3661", "3008", "2451", "6239"]
 
-    st.write(f"📊 準備掃描評分：**{len(target_stocks)}** 檔股票（當前策略：**{strategy}**）")
+    st.write(f"📊 準備掃描評分：**{len(target_stocks)}** 档股票（當前策略：**{strategy}**）")
     progress_bar = st.progress(0)
     
     results = []
